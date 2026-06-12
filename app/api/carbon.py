@@ -324,8 +324,6 @@ def allocate_carbon_budget(
     current_user=Depends(require_roles("admin", "park_manager", "property_manager")),
 ):
     total_budget = allocate_in.total_budget
-    start_date = allocate_in.start_date
-    end_date = allocate_in.end_date
     period = allocate_in.period
     allocate_type = allocate_in.allocate_type
     building_id = allocate_in.building_id
@@ -333,11 +331,32 @@ def allocate_carbon_budget(
     if allocate_type not in ["area", "employee", "history"]:
         raise HTTPException(status_code=400, detail="分摊方式必须是 area(按面积)/employee(按人数)/history(按历史用量)")
 
-    if not start_date or not end_date:
-        raise HTTPException(status_code=400, detail="开始日期和结束日期不能为空")
+    date_error_msg = (
+        "日期参数格式错误，start_date 和 end_date 必须使用 YYYY-MM-DD 格式，"
+        "例如 start_date=2024-01-01&end_date=2024-12-31。"
+    )
+
+    if not allocate_in.start_date or not allocate_in.end_date:
+        raise HTTPException(status_code=400, detail=date_error_msg)
+
+    try:
+        start_date = datetime.strptime(allocate_in.start_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"start_date 格式错误：'{allocate_in.start_date}' 不是合法日期。" + date_error_msg,
+        )
+
+    try:
+        end_date = datetime.strptime(allocate_in.end_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"end_date 格式错误：'{allocate_in.end_date}' 不是合法日期。" + date_error_msg,
+        )
 
     if start_date >= end_date:
-        raise HTTPException(status_code=400, detail="开始日期必须早于结束日期")
+        raise HTTPException(status_code=400, detail=f"开始日期必须早于结束日期（start_date={start_date}, end_date={end_date}）")
 
     if building_id is not None:
         building = db.query(Enterprise.building_id).filter(Enterprise.building_id == building_id).first()
@@ -361,18 +380,42 @@ def allocate_carbon_budget(
         elif allocate_type == "employee":
             weight = ent.employee_count or 0.0
         elif allocate_type == "history":
-            start_dt = datetime.combine(start_date, datetime.min.time()) - timedelta(days=365)
-            end_dt = datetime.combine(end_date, datetime.max.time()) - timedelta(days=365)
+            hist_carbon = 0.0
+            year_ago_start = start_date - timedelta(days=365)
+            year_ago_end = end_date - timedelta(days=365)
             hist_carbon = (
                 db.query(func.sum(CarbonData.carbon_emission))
                 .filter(
                     CarbonData.enterprise_id == ent.id,
-                    CarbonData.data_date >= start_dt.date(),
-                    CarbonData.data_date <= end_dt.date(),
+                    CarbonData.data_date >= year_ago_start,
+                    CarbonData.data_date <= year_ago_end,
                 )
                 .scalar()
                 or 0.0
             )
+            if hist_carbon <= 0:
+                hist_energy = (
+                    db.query(func.sum(EnergyData.usage_value))
+                    .filter(
+                        EnergyData.enterprise_id == ent.id,
+                        EnergyData.data_time >= datetime.combine(year_ago_start, datetime.min.time()),
+                        EnergyData.data_time <= datetime.combine(year_ago_end, datetime.max.time()),
+                    )
+                    .scalar()
+                    or 0.0
+                )
+                hist_carbon = hist_energy * settings.CARBON_FACTOR_ELECTRICITY
+
+            if hist_carbon <= 0:
+                recent_energy = (
+                    db.query(func.sum(EnergyData.usage_value))
+                    .filter(
+                        EnergyData.enterprise_id == ent.id,
+                    )
+                    .scalar()
+                    or 0.0
+                )
+                hist_carbon = recent_energy * settings.CARBON_FACTOR_ELECTRICITY
             weight = hist_carbon
         else:
             weight = 1.0
@@ -380,7 +423,10 @@ def allocate_carbon_budget(
         total_weight += weight
 
     if total_weight <= 0:
-        raise HTTPException(status_code=400, detail="总权重为0，无法分配")
+        raise HTTPException(
+            status_code=400,
+            detail="总权重为0，无法分配。请检查所选企业是否有面积/人数/历史能耗数据。",
+        )
 
     allocated = []
     for ent in enterprises:
@@ -423,7 +469,7 @@ def allocate_carbon_budget(
                 "enterprise_id": ent.id,
                 "enterprise_name": ent.name,
                 "budget_value": round(share, 4),
-                "weight": weights[ent.id],
+                "weight": round(weights[ent.id], 4),
                 "weight_ratio": round(weights[ent.id] / total_weight * 100, 2),
             }
         )
@@ -436,8 +482,8 @@ def allocate_carbon_budget(
         data={
             "total_budget": total_budget,
             "allocate_type": allocate_type,
-            "start_date": start_date,
-            "end_date": end_date,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
             "building_id": building_id,
             "period": period,
             "allocated_count": len(allocated),

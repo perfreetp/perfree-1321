@@ -17,6 +17,7 @@ from app.models.models import (
     CarbonData,
     Quota,
     User,
+    Meter,
 )
 from app.schemas.schemas import (
     BillCreate,
@@ -80,12 +81,13 @@ def list_bills(
     bill_month: Optional[str] = Query(None, description="账期月份，格式YYYY-MM"),
     energy_type: Optional[str] = Query(None, description="能源类型"),
     status: Optional[str] = Query(None, description="账单状态"),
+    building_id: Optional[int] = Query(None, description="楼栋ID，不传查全部，传0查全园区分摊"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(50, ge=1, le=500, description="每页数量"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    query = db.query(Bill).join(Enterprise, Bill.enterprise_id == Enterprise.id)
+    query = db.query(Bill).join(Enterprise, Bill.enterprise_id == Enterprise.id, isouter=True)
 
     if current_user.role == "enterprise_user" and current_user.enterprise_id:
         query = query.filter(Bill.enterprise_id == current_user.enterprise_id)
@@ -98,33 +100,47 @@ def list_bills(
         query = query.filter(Bill.energy_type == energy_type)
     if status:
         query = query.filter(Bill.status == status)
+    if building_id is not None:
+        if building_id == 0:
+            query = query.filter(Bill.building_id.is_(None))
+        else:
+            query = query.filter(Bill.building_id == building_id)
 
     total = query.count()
     items = query.order_by(Bill.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
 
-    data = [
-        {
-            "id": item.id,
-            "enterprise_id": item.enterprise_id,
-            "enterprise_name": item.enterprise.name if item.enterprise else None,
-            "bill_month": item.bill_month,
-            "energy_type": item.energy_type,
-            "usage": item.usage,
-            "peak_usage": item.peak_usage,
-            "flat_usage": item.flat_usage,
-            "valley_usage": item.valley_usage,
-            "amount": item.amount,
-            "peak_amount": item.peak_amount,
-            "flat_amount": item.flat_amount,
-            "valley_amount": item.valley_amount,
-            "status": item.status,
-            "due_date": item.due_date,
-            "paid_date": item.paid_date,
-            "description": item.description,
-            "created_at": item.created_at,
-        }
-        for item in items
-    ]
+    data = []
+    for item in items:
+        scope = "全园区" if item.building_id is None else "单楼栋"
+        building_name = None
+        if item.building_id:
+            bld = db.query(Building).filter(Building.id == item.building_id).first()
+            building_name = bld.name if bld else None
+        data.append(
+            {
+                "id": item.id,
+                "enterprise_id": item.enterprise_id,
+                "enterprise_name": item.enterprise.name if item.enterprise else None,
+                "bill_month": item.bill_month,
+                "energy_type": item.energy_type,
+                "usage": item.usage,
+                "peak_usage": item.peak_usage,
+                "flat_usage": item.flat_usage,
+                "valley_usage": item.valley_usage,
+                "amount": item.amount,
+                "peak_amount": item.peak_amount,
+                "flat_amount": item.flat_amount,
+                "valley_amount": item.valley_amount,
+                "status": item.status,
+                "due_date": item.due_date,
+                "paid_date": item.paid_date,
+                "building_id": item.building_id,
+                "building_name": building_name,
+                "scope": scope,
+                "description": item.description,
+                "created_at": item.created_at,
+            }
+        )
 
     return GenericResponse(
         code=200,
@@ -151,6 +167,12 @@ def get_bill(
     if current_user.role == "enterprise_user" and current_user.enterprise_id != bill.enterprise_id:
         raise HTTPException(status_code=403, detail="无权查看该账单")
 
+    scope = "全园区" if bill.building_id is None else "单楼栋"
+    building_name = None
+    if bill.building_id:
+        bld = db.query(Building).filter(Building.id == bill.building_id).first()
+        building_name = bld.name if bld else None
+
     data = {
         "id": bill.id,
         "enterprise_id": bill.enterprise_id,
@@ -168,6 +190,9 @@ def get_bill(
         "status": bill.status,
         "due_date": bill.due_date,
         "paid_date": bill.paid_date,
+        "building_id": bill.building_id,
+        "building_name": building_name,
+        "scope": scope,
         "description": bill.description,
         "created_at": bill.created_at,
     }
@@ -258,6 +283,15 @@ def split_bill(
     result_items: List[dict] = []
     summary_by_energy = {}
 
+    building_meter_ids = []
+    if split_in.building_id:
+        building_meters = (
+            db.query(Meter)
+            .filter(Meter.building_id == split_in.building_id)
+            .all()
+        )
+        building_meter_ids = [m.id for m in building_meters]
+
     for energy_type in energy_types:
         energy_query = db.query(EnergyData).filter(
             EnergyData.energy_type == energy_type,
@@ -265,7 +299,10 @@ def split_bill(
             EnergyData.data_time < end_dt,
         )
         if split_in.building_id:
-            energy_query = energy_query.filter(EnergyData.enterprise_id.in_(enterprise_ids))
+            energy_query = energy_query.filter(
+                (EnergyData.enterprise_id.in_(enterprise_ids))
+                | (EnergyData.meter_id.in_(building_meter_ids))
+            )
         raw_energy = energy_query.all()
 
         total_usage = sum(item.usage_value for item in raw_energy)
@@ -353,6 +390,7 @@ def split_bill(
                     Bill.enterprise_id == ent.id,
                     Bill.bill_month == split_in.bill_month,
                     Bill.energy_type == energy_type,
+                    Bill.building_id == split_in.building_id if split_in.building_id else Bill.building_id.is_(None),
                 )
                 .first()
             )
@@ -367,6 +405,7 @@ def split_bill(
                 existing_bill.flat_amount = ent_flat_amount
                 existing_bill.valley_amount = ent_valley_amount
                 existing_bill.description = bill_description
+                existing_bill.building_id = split_in.building_id
                 bill_id = existing_bill.id
             else:
                 new_bill = Bill(
@@ -382,6 +421,7 @@ def split_bill(
                     flat_amount=ent_flat_amount,
                     valley_amount=ent_valley_amount,
                     status="unpaid",
+                    building_id=split_in.building_id,
                     description=bill_description,
                 )
                 db.add(new_bill)

@@ -221,6 +221,7 @@ class Bill(Base):
     status = Column(String(50), default="unpaid")
     due_date = Column(Date)
     paid_date = Column(Date)
+    building_id = Column(Integer, nullable=True)
     description = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
