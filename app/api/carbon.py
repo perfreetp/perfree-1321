@@ -18,6 +18,7 @@ from app.schemas.schemas import (
     LoadForecastItem,
     LoadForecastResponse,
     GenericResponse,
+    CarbonBudgetAllocate,
 )
 from app.utils.auth import get_current_user, require_roles
 
@@ -318,23 +319,30 @@ def delete_carbon_budget(
 
 @router.post("/carbon/budget/allocate", response_model=GenericResponse)
 def allocate_carbon_budget(
-    allocate_in: dict,
+    allocate_in: CarbonBudgetAllocate,
     db: Session = Depends(get_db),
     current_user=Depends(require_roles("admin", "park_manager", "property_manager")),
 ):
-    total_budget = allocate_in.get("total_budget")
-    start_date = allocate_in.get("start_date")
-    end_date = allocate_in.get("end_date")
-    period = allocate_in.get("period", "month")
-    allocate_type = allocate_in.get("allocate_type", "area")
-    building_id = allocate_in.get("building_id")
+    total_budget = allocate_in.total_budget
+    start_date = allocate_in.start_date
+    end_date = allocate_in.end_date
+    period = allocate_in.period
+    allocate_type = allocate_in.allocate_type
+    building_id = allocate_in.building_id
 
-    if not total_budget or total_budget <= 0:
-        raise HTTPException(status_code=400, detail="总预算必须大于0")
+    if allocate_type not in ["area", "employee", "history"]:
+        raise HTTPException(status_code=400, detail="分摊方式必须是 area(按面积)/employee(按人数)/history(按历史用量)")
+
     if not start_date or not end_date:
         raise HTTPException(status_code=400, detail="开始日期和结束日期不能为空")
+
     if start_date >= end_date:
         raise HTTPException(status_code=400, detail="开始日期必须早于结束日期")
+
+    if building_id is not None:
+        building = db.query(Enterprise.building_id).filter(Enterprise.building_id == building_id).first()
+        if not building:
+            raise HTTPException(status_code=400, detail=f"楼栋ID {building_id} 不存在或无关联企业")
 
     enterprises_query = db.query(Enterprise).filter(Enterprise.status == "active")
     if building_id:
@@ -391,6 +399,9 @@ def allocate_carbon_budget(
         if existing:
             existing.budget_value = round(share, 4)
             existing.allocated_by = allocate_type
+            existing.start_date = start_date
+            existing.end_date = end_date
+            existing.period = period
             budget_id = existing.id
         else:
             new_budget = CarbonBudget(
@@ -400,7 +411,7 @@ def allocate_carbon_budget(
                 start_date=start_date,
                 end_date=end_date,
                 allocated_by=allocate_type,
-                description=f"按{allocate_type}自动分配",
+                description=f"按{allocate_type}自动分配{'（楼栋ID:' + str(building_id) + '）' if building_id else ''}",
             )
             db.add(new_budget)
             db.flush()
@@ -408,12 +419,12 @@ def allocate_carbon_budget(
 
         allocated.append(
             {
+                "budget_id": budget_id,
                 "enterprise_id": ent.id,
                 "enterprise_name": ent.name,
                 "budget_value": round(share, 4),
                 "weight": weights[ent.id],
                 "weight_ratio": round(weights[ent.id] / total_weight * 100, 2),
-                "budget_id": budget_id,
             }
         )
 
@@ -427,6 +438,8 @@ def allocate_carbon_budget(
             "allocate_type": allocate_type,
             "start_date": start_date,
             "end_date": end_date,
+            "building_id": building_id,
+            "period": period,
             "allocated_count": len(allocated),
             "items": allocated,
         },

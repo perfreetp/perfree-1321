@@ -312,6 +312,15 @@ class CarbonBudgetResponse(CarbonBudgetBase):
         from_attributes = True
 
 
+class CarbonBudgetAllocate(BaseModel):
+    total_budget: float = Field(..., gt=0, description="总碳预算值，必须大于0")
+    start_date: date
+    end_date: date
+    period: Optional[str] = "month"
+    allocate_type: Optional[str] = Field("area", description="分摊方式：area(按面积)/employee(按人数)/history(按历史用量)")
+    building_id: Optional[int] = Field(None, description="楼栋ID，不传则分摊整个园区")
+
+
 class QuotaBase(BaseModel):
     enterprise_id: int
     energy_type: str

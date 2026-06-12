@@ -62,11 +62,40 @@ def create_energy_data(
 ):
     meter = db.query(Meter).filter(Meter.id == data_in.meter_id).first()
     if not meter:
-        raise HTTPException(status_code=404, detail="电表不存在")
+        raise HTTPException(status_code=404, detail=f"表计ID {data_in.meter_id} 不存在")
+
+    if meter.status != "active":
+        raise HTTPException(status_code=400, detail=f"表计 {meter.code} 当前状态为 {meter.status}，无法录入数据")
+
+    if data_in.energy_type != meter.energy_type:
+        raise HTTPException(
+            status_code=400,
+            detail=f"能源类型不匹配：该表计（{meter.code}）类型为 {meter.energy_type}，"
+                   f"但传入的是 {data_in.energy_type}。电表只能录入 electricity，燃气表只能录入 gas，"
+                   f"热量表只能录入 heat，水表只能录入 water。"
+        )
+
+    if data_in.enterprise_id is not None:
+        if meter.enterprise_id is not None and data_in.enterprise_id != meter.enterprise_id:
+            meter_ent = db.query(Enterprise).filter(Enterprise.id == meter.enterprise_id).first()
+            param_ent = db.query(Enterprise).filter(Enterprise.id == data_in.enterprise_id).first()
+            meter_name = meter_ent.name if meter_ent else str(meter.enterprise_id)
+            param_name = param_ent.name if param_ent else str(data_in.enterprise_id)
+            raise HTTPException(
+                status_code=400,
+                detail=f"企业绑定关系不一致：该表计（{meter.code}）已绑定企业「{meter_name}」（ID:{meter.enterprise_id}），"
+                       f"但传入的企业是「{param_name}」（ID:{data_in.enterprise_id}）。"
+                       f"如需修改，请通过表计绑定接口调整。"
+            )
+        if meter.enterprise_id is None:
+            enterprise = db.query(Enterprise).filter(Enterprise.id == data_in.enterprise_id).first()
+            if not enterprise:
+                raise HTTPException(status_code=400, detail=f"企业ID {data_in.enterprise_id} 不存在")
 
     enterprise_id = data_in.enterprise_id or meter.enterprise_id
+
     peak_type = data_in.peak_type or get_peak_type(data_in.data_time.hour)
-    price = data_in.price if data_in.price != 0 else get_energy_price(data_in.energy_type, peak_type)
+    price = data_in.price if data_in.price and data_in.price != 0 else get_energy_price(data_in.energy_type, peak_type)
 
     energy_data = EnergyData(
         meter_id=data_in.meter_id,
@@ -85,7 +114,15 @@ def create_energy_data(
     return GenericResponse(
         code=201,
         message="能耗数据录入成功",
-        data={"id": energy_data.id},
+        data={
+            "id": energy_data.id,
+            "meter_code": meter.code,
+            "energy_type": energy_data.energy_type,
+            "enterprise_id": enterprise_id,
+            "usage_value": energy_data.usage_value,
+            "peak_type": peak_type,
+            "price": price,
+        },
     )
 
 

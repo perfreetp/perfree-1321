@@ -218,43 +218,90 @@ def split_bill(
     if split_type not in ["area", "headcount", "usage"]:
         raise HTTPException(status_code=400, detail="分摊方式必须是 area/headcount/usage")
 
+    if not split_in.bill_month or len(split_in.bill_month) != 7 or "-" not in split_in.bill_month:
+        raise HTTPException(status_code=400, detail="账期月份格式错误，应为 YYYY-MM")
+
+    try:
+        year, month = map(int, split_in.bill_month.split("-"))
+        if month < 1 or month > 12:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="账期月份格式错误，应为 YYYY-MM，例如 2024-06")
+
+    try:
+        start_date = date(year, month, 1)
+        if month == 12:
+            end_date = date(year + 1, 1, 1)
+        else:
+            end_date = date(year, month + 1, 1)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"账期日期不合法: {str(e)}")
+
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.min.time())
+
     enterprises_query = db.query(Enterprise)
+    building = None
     if split_in.building_id:
         building = db.query(Building).filter(Building.id == split_in.building_id).first()
         if not building:
-            raise HTTPException(status_code=404, detail="楼栋不存在")
+            raise HTTPException(status_code=400, detail=f"楼栋ID {split_in.building_id} 不存在")
         enterprises_query = enterprises_query.filter(Enterprise.building_id == split_in.building_id)
 
     enterprises = enterprises_query.filter(Enterprise.status == "active").all()
     if not enterprises:
         raise HTTPException(status_code=400, detail="未找到可用企业")
 
+    enterprise_ids = [ent.id for ent in enterprises]
+
     energy_types = ["electricity", "gas", "heat", "water"]
     result_items: List[dict] = []
-
-    year, month = map(int, split_in.bill_month.split("-"))
-    start_date = date(year, month, 1)
-    if month == 12:
-        end_date = date(year + 1, 1, 1)
-    else:
-        end_date = date(year, month + 1, 1)
-    start_dt = datetime.combine(start_date, datetime.min.time())
-    end_dt = datetime.combine(end_date, datetime.min.time())
+    summary_by_energy = {}
 
     for energy_type in energy_types:
-        total_usage = (
-            db.query(func.sum(EnergyData.usage_value))
-            .filter(
-                EnergyData.energy_type == energy_type,
-                EnergyData.data_time >= start_dt,
-                EnergyData.data_time < end_dt,
-            )
-            .scalar()
-            or 0.0
+        energy_query = db.query(EnergyData).filter(
+            EnergyData.energy_type == energy_type,
+            EnergyData.data_time >= start_dt,
+            EnergyData.data_time < end_dt,
         )
+        if split_in.building_id:
+            energy_query = energy_query.filter(EnergyData.enterprise_id.in_(enterprise_ids))
+        raw_energy = energy_query.all()
+
+        total_usage = sum(item.usage_value for item in raw_energy)
+        total_cost = sum(item.usage_value * item.price for item in raw_energy)
 
         if total_usage <= 0:
             continue
+
+        peak_usage_total = 0.0
+        flat_usage_total = 0.0
+        valley_usage_total = 0.0
+        peak_cost_total = 0.0
+        flat_cost_total = 0.0
+        valley_cost_total = 0.0
+        for item in raw_energy:
+            pt = item.peak_type or "flat"
+            if pt == "peak":
+                peak_usage_total += item.usage_value
+                peak_cost_total += item.usage_value * item.price
+            elif pt == "valley":
+                valley_usage_total += item.usage_value
+                valley_cost_total += item.usage_value * item.price
+            else:
+                flat_usage_total += item.usage_value
+                flat_cost_total += item.usage_value * item.price
+
+        summary_by_energy[energy_type] = {
+            "total_usage": round(total_usage, 4),
+            "total_cost": round(total_cost, 2),
+            "peak_usage": round(peak_usage_total, 4),
+            "flat_usage": round(flat_usage_total, 4),
+            "valley_usage": round(valley_usage_total, 4),
+            "peak_cost": round(peak_cost_total, 2),
+            "flat_cost": round(flat_cost_total, 2),
+            "valley_cost": round(valley_cost_total, 2),
+        }
 
         total_weight = 0.0
         enterprise_weights = {}
@@ -285,21 +332,20 @@ def split_bill(
         for ent in enterprises:
             weight = enterprise_weights.get(ent.id, 0.0)
             share_ratio = weight / total_weight if total_weight > 0 else 0.0
-            ent_usage = total_usage * share_ratio
 
-            if energy_type == "electricity":
-                peak_price = settings.ELECTRICITY_PEAK_PRICE
-                flat_price = settings.ELECTRICITY_FLAT_PRICE
-                valley_price = settings.ELECTRICITY_VALLEY_PRICE
-                avg_price = (peak_price + flat_price + valley_price) / 3
-            elif energy_type == "gas":
-                avg_price = settings.GAS_PRICE
-            elif energy_type == "heat":
-                avg_price = settings.HEAT_PRICE
-            else:
-                avg_price = settings.WATER_PRICE
+            ent_usage = round(total_usage * share_ratio, 4)
+            ent_amount = round(total_cost * share_ratio, 2)
+            ent_peak_usage = round(peak_usage_total * share_ratio, 4)
+            ent_flat_usage = round(flat_usage_total * share_ratio, 4)
+            ent_valley_usage = round(valley_usage_total * share_ratio, 4)
+            ent_peak_amount = round(peak_cost_total * share_ratio, 2)
+            ent_flat_amount = round(flat_cost_total * share_ratio, 2)
+            ent_valley_amount = round(valley_cost_total * share_ratio, 2)
 
-            share_amount = ent_usage * avg_price
+            scope_label = f"楼栋{building.name}" if building else "全园区"
+            bill_description = (
+                f"{split_in.bill_month} {energy_type} 账单（{scope_label}分摊，方式:{split_type}）"
+            )
 
             existing_bill = (
                 db.query(Bill)
@@ -313,13 +359,14 @@ def split_bill(
 
             if existing_bill:
                 existing_bill.usage = ent_usage
-                existing_bill.amount = share_amount
-                existing_bill.peak_usage = ent_usage * 0.3
-                existing_bill.flat_usage = ent_usage * 0.5
-                existing_bill.valley_usage = ent_usage * 0.2
-                existing_bill.peak_amount = ent_usage * 0.3 * settings.ELECTRICITY_PEAK_PRICE if energy_type == "electricity" else 0
-                existing_bill.flat_amount = ent_usage * 0.5 * settings.ELECTRICITY_FLAT_PRICE if energy_type == "electricity" else 0
-                existing_bill.valley_amount = ent_usage * 0.2 * settings.ELECTRICITY_VALLEY_PRICE if energy_type == "electricity" else 0
+                existing_bill.amount = ent_amount
+                existing_bill.peak_usage = ent_peak_usage
+                existing_bill.flat_usage = ent_flat_usage
+                existing_bill.valley_usage = ent_valley_usage
+                existing_bill.peak_amount = ent_peak_amount
+                existing_bill.flat_amount = ent_flat_amount
+                existing_bill.valley_amount = ent_valley_amount
+                existing_bill.description = bill_description
                 bill_id = existing_bill.id
             else:
                 new_bill = Bill(
@@ -327,15 +374,15 @@ def split_bill(
                     bill_month=split_in.bill_month,
                     energy_type=energy_type,
                     usage=ent_usage,
-                    peak_usage=ent_usage * 0.3,
-                    flat_usage=ent_usage * 0.5,
-                    valley_usage=ent_usage * 0.2,
-                    amount=share_amount,
-                    peak_amount=ent_usage * 0.3 * settings.ELECTRICITY_PEAK_PRICE if energy_type == "electricity" else 0,
-                    flat_amount=ent_usage * 0.5 * settings.ELECTRICITY_FLAT_PRICE if energy_type == "electricity" else 0,
-                    valley_amount=ent_usage * 0.2 * settings.ELECTRICITY_VALLEY_PRICE if energy_type == "electricity" else 0,
+                    peak_usage=ent_peak_usage,
+                    flat_usage=ent_flat_usage,
+                    valley_usage=ent_valley_usage,
+                    amount=ent_amount,
+                    peak_amount=ent_peak_amount,
+                    flat_amount=ent_flat_amount,
+                    valley_amount=ent_valley_amount,
                     status="unpaid",
-                    description=f"{split_in.bill_month} {energy_type} 账单分摊（{split_type}）",
+                    description=bill_description,
                 )
                 db.add(new_bill)
                 db.flush()
@@ -346,8 +393,8 @@ def split_bill(
                     enterprise_id=ent.id,
                     enterprise_name=ent.name,
                     total_usage=ent_usage,
-                    share_ratio=round(share_ratio, 4),
-                    share_amount=round(share_amount, 2),
+                    share_ratio=round(share_ratio, 6),
+                    share_amount=ent_amount,
                     energy_type=energy_type,
                 ).model_dump()
             )
@@ -361,7 +408,10 @@ def split_bill(
         data={
             "bill_month": split_in.bill_month,
             "split_type": split_type,
+            "building_id": split_in.building_id,
+            "building_name": building.name if building else None,
             "count": len(result_items),
+            "energy_summary": summary_by_energy,
             "items": result_items,
         },
     )

@@ -70,13 +70,19 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="邮箱已被使用",
             )
+
+    allowed_roles = {"viewer", "enterprise_user"}
+    role = user_in.role if user_in.role in allowed_roles else "viewer"
+    if role == "enterprise_user" and not user_in.enterprise_id:
+        role = "viewer"
+
     db_user = User(
         username=user_in.username,
         email=user_in.email,
         full_name=user_in.full_name,
         phone=user_in.phone,
-        role=user_in.role,
-        enterprise_id=user_in.enterprise_id,
+        role=role,
+        enterprise_id=user_in.enterprise_id if role == "enterprise_user" else None,
         hashed_password=get_password_hash(user_in.password),
         is_active=True,
     )
